@@ -55,8 +55,8 @@ func main() {
 
 	logger.Info("Proxy starting", "Built on", version.BuildRef, "From Git SHA", version.CommitSHA)
 
-	if *connector != proxy.ConnectorNIXLV2 && *connector != proxy.ConnectorLMCache {
-		logger.Info("Error: --connector must either be 'nixlv2' or 'lmcache'")
+	if *connector != proxy.ConnectorNIXLV2 && *connector != proxy.ConnectorLMCache && *connector != proxy.ConnectorSGLang {
+		logger.Info("Error: --connector must either be 'nixlv2', 'sglang', or 'lmcache'")
 		return
 	}
 	logger.Info("p/d connector validated", "connector", connector)

@@ -50,11 +50,22 @@ const (
 	requestFieldStream              = "stream"
 	requestFieldStreamOptions       = "stream_options"
 
+	// SGLang bootstrap fields
+	requestFieldBootstrapHost = "bootstrap_host"
+	requestFieldBootstrapPort = "bootstrap_port"
+	requestFieldBootstrapRoom = "bootstrap_room"
+	// TODO: unused remove
+	// requestFieldBootstrapRoomID = "bootstrap_room_id"
+	// requestFieldRoomID          = "room_id"
+
 	// ConnectorNIXLV2 enables the P/D NIXL v2 protocol
 	ConnectorNIXLV2 = "nixlv2"
 
 	// ConnectorLMCache enables (now deprecated) P/D LMCache protocol
 	ConnectorLMCache = "lmcache"
+
+	// ConnectorSGLang enables SGLang P/D disaggregation protocol
+	ConnectorSGLang = "sglang"
 )
 
 // Config represents the proxy server configuration
@@ -126,6 +137,8 @@ func NewProxy(port string, decodeURL *url.URL, config Config) (*Server, error) {
 	switch config.Connector {
 	case ConnectorLMCache:
 		server.runConnectorProtocol = server.runLMCacheProtocol
+	case ConnectorSGLang:
+		server.runConnectorProtocol = server.runSGLangProtocol
 	case ConnectorNIXLV2:
 		fallthrough
 	default:
