@@ -138,7 +138,8 @@ lint: check-golangci-lint check-typos ## Run lint
 build: build-epp build-sidecar ## Build the project
 
 .PHONY: build-%
-build-%: check-go install-dependencies download-tokenizer ## Build the project
+## build-%: check-go install-dependencies download-tokenizer ## Build the project
+build-%: ## Build the project
 	@printf "\033[33;1m==== Building ====\033[0m\n"
 	go build $($*_LDFLAGS) -o bin/$($*_NAME) cmd/$($*_NAME)/main.go
 

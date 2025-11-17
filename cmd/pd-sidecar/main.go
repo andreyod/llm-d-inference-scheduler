@@ -28,6 +28,15 @@ import (
 	"github.com/llm-d/llm-d-inference-scheduler/pkg/sidecar/version"
 )
 
+var (
+	// supportedConnectors defines all valid P/D connector types
+	supportedConnectors = []string{
+		proxy.ConnectorNIXLV2,
+		proxy.ConnectorLMCache,
+		proxy.ConnectorSGLang,
+	}
+)
+
 func main() {
 	port := flag.String("port", "8000", "the port the sidecar is listening on")
 	vLLMPort := flag.String("vllm-port", "8001", "the port vLLM is listening on")
@@ -57,8 +66,15 @@ func main() {
 
 	logger.Info("Proxy starting", "Built on", version.BuildRef, "From Git SHA", version.CommitSHA)
 
-	if *connector != proxy.ConnectorNIXLV2 && *connector != proxy.ConnectorLMCache {
-		logger.Info("Error: --connector must either be 'nixlv2' or 'lmcache'")
+	isValidConnector := false
+	for _, validConnector := range supportedConnectors {
+		if *connector == validConnector {
+			isValidConnector = true
+			break
+		}
+	}
+	if !isValidConnector {
+		logger.Info("Error: --connector must be one of: nixlv2, lmcache, sglang")
 		return
 	}
 	logger.Info("p/d connector validated", "connector", connector)
