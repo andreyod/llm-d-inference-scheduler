@@ -19,6 +19,8 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
 	"os"
 	"strconv"
 	"strings"
@@ -68,7 +70,43 @@ func (s *Server) runSGLangProtocol(w http.ResponseWriter, r *http.Request, prefi
 
 	// Send concurrent prefill and decode requests
 	s.sendSGLangConcurrentRequests(w, newReq, prefillPodHostPort)
+
+	// Send prefill and decode requests
+	//s.serveSGLangPDRequests(w, newReq, prefillPodHostPort)
+
+	// TEMP ignore bootstrap info
+	// s.sendSGLangConcurrentRequests(w, r, prefillPodHostPort)
 }
+
+// func (s *Server) serveSGLangPDRequests(w http.ResponseWriter, r *http.Request, prefillHost string) {
+// 	prefillHandler, err := s.prefillerProxyHandler(prefillHost)
+// 	if err != nil {
+// 		s.logger.Error(err, "failed to get prefiller proxy handler", "prefill_host", prefillHost)
+// 		return
+// 	}
+// 	pw := &bufferedResponseWriter{}
+
+// 	dump, err := httputil.DumpRequest(r, true) // 'true' to include the body
+// 	if err != nil {
+// 		s.logger.Info("--------------------- Dump request failed", "error", err)
+// 	}
+// 	s.logger.V(5).Info("---- request before copy", "--------------- r:", dump)
+
+// 	// Serve the prefill request
+// 	s.logger.V(5).Info("sending request to prefiller", "destination", prefillHost)
+// 	go func() {
+// 		prefillHandler.ServeHTTP(pw, r)
+// 		if pw.statusCode < http.StatusOK || pw.statusCode >= http.StatusMultipleChoices {
+// 			s.logger.Error(fmt.Errorf("prefill request failed with status %d", pw.statusCode), "prefill request error")
+// 			return
+// 		}
+// 		s.logger.V(5).Info("received prefiller response", "status code", pw.statusCode, "body", pw.buffer.String())
+// 	}()
+
+// 	// Serve the decode request
+// 	s.logger.V(5).Info("serving decode request", "url", s.decoderURL.String())
+// 	s.decoderProxy.ServeHTTP(w, r)
+// }
 
 func (s *Server) sendSGLangConcurrentRequests(w http.ResponseWriter, r *http.Request, prefillHost string) {
 	Req := r.Clone(r.Context())
@@ -82,13 +120,37 @@ func (s *Server) sendSGLangConcurrentRequests(w http.ResponseWriter, r *http.Req
 			s.logger.Error(err, "failed to get prefiller proxy handler", "prefill_host", prefillHost)
 			return
 		}
-		pw := &bufferedResponseWriter{}
+		// pw := &bufferedResponseWriter{}
+		// Debug --------------------------------------------------------------
+		tw := httptest.NewRecorder()
+		dump, err := httputil.DumpRequest(r, true) // 'true' to include the body
+		if err != nil {
+			s.logger.Info("--------------------- Dump request failed", "error", err)
+		}
+		s.logger.V(5).Info("---- request before copy", "--------------- r:", dump)
+		s.logger.Info("----------------------------------------------------------")
 
-		prefillHandler.ServeHTTP(pw, Req)
-		s.logger.V(5).Info("prefill request completed", "status", pw.statusCode)
+		dump, err = httputil.DumpRequest(Req, true) // 'true' to include the body
+		if err != nil {
+			s.logger.Info("--------------------- Dump request failed", "error", err)
+		}
+		s.logger.V(5).Info("---- sending prefill request", "--------------- Req:", dump)
+		// ---------------------------------------------------------------------
+		// prefillHandler.ServeHTTP(pw, Req)
+		// s.logger.V(5).Info("prefill request completed", "status", pw.statusCode)
+
+		//prefillHandler.ServeHTTP(tw, Req)
+		prefillHandler.ServeHTTP(tw, r)
+		s.logger.V(5).Info("---- prefill request completed", "status", tw.Code, "body: ", tw.Body.String())
 	}()
+	// Debug --------------------------------------------------------------
+	s.logger.V(5).Info("sending decode request", "---------------:")
+	// ----------------------------------------------------------------------
 	// Send decode request synchronously
-	s.decoderProxy.ServeHTTP(w, Req)
+	//s.decoderProxy.ServeHTTP(w, Req)
+	s.decoderProxy.ServeHTTP(w, r)
+	// Debug --------------------------------------------------------------
+	s.logger.V(5).Info("got decode response", "---------------:", w)
 }
 
 func (s *Server) addSGLangBootstrapInfo(requestData map[string]interface{}, prefillHostPort string, roomID int64) map[string]interface{} {
