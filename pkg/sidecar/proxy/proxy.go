@@ -28,6 +28,9 @@ import (
 
 	"github.com/go-logr/logr"
 	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/llm-d/llm-d-inference-scheduler/pkg/sidecar/proxy/handlers/nixlv2"
+	"github.com/llm-d/llm-d-inference-scheduler/pkg/sidecar/proxy/handlers/sglang"
+	sharedstorage "github.com/llm-d/llm-d-inference-scheduler/pkg/sidecar/proxy/handlers/shared_storage"
 	"golang.org/x/sync/errgroup"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -57,6 +60,11 @@ const (
 	requestFieldBootstrapHost = "bootstrap_host"
 	requestFieldBootstrapPort = "bootstrap_port"
 	requestFieldBootstrapRoom = "bootstrap_room"
+
+	// chatCompletionsPath is the OpenAI chat completions path
+	chatCompletionsPath = "/v1/chat/completions"
+	// completionsPath is the legacy completions path
+	completionsPath = "/v1/completions"
 
 	// ConnectorNIXLV2 enables the P/D NIXL v2 protocol
 	ConnectorNIXLV2 = "nixlv2"
@@ -95,18 +103,23 @@ type Config struct {
 	EnablePrefillerSampling bool
 }
 
-type protocolRunner func(http.ResponseWriter, *http.Request, string)
+// type protocolRunner func(http.ResponseWriter, *http.Request, string)
+
+type Handlers interface {
+	// ChatCompletionsHandler makes the connector itself a valid handler
+	ChatCompletionsHandler(w http.ResponseWriter, r *http.Request)
+}
 
 // Server is the reverse proxy server
 type Server struct {
-	logger               logr.Logger
-	addr                 net.Addr     // the proxy TCP address
-	port                 string       // the proxy TCP port
-	decoderURL           *url.URL     // the local decoder URL
-	handler              http.Handler // the handler function. either a Mux or a proxy
-	allowlistValidator   *AllowlistValidator
-	runConnectorProtocol protocolRunner // the handler for running the protocol
-	prefillerURLPrefix   string
+	logger             logr.Logger
+	addr               net.Addr     // the proxy TCP address
+	port               string       // the proxy TCP port
+	decoderURL         *url.URL     // the local decoder URL
+	handler            http.Handler // the handler function. either a Mux or a proxy
+	allowlistValidator *AllowlistValidator
+	//runConnectorProtocol protocolRunner // the handler for running the protocol
+	prefillerURLPrefix string
 
 	decoderProxy        http.Handler                     // decoder proxy handler
 	prefillerProxies    *lru.Cache[string, http.Handler] // cached prefiller proxy handlers
@@ -116,6 +129,8 @@ type Server struct {
 	prefillSamplerFn func(n int) int // allow test override
 
 	config Config
+
+	handlers Handlers
 }
 
 // NewProxy creates a new routing reverse proxy
@@ -133,13 +148,27 @@ func NewProxy(port string, decodeURL *url.URL, config Config) *Server {
 		prefillSamplerFn:    rand.Intn,
 	}
 
-	server.setConnector()
+	//server.setConnector()
+	server.setHandlers()
 
 	if config.PrefillerUseTLS {
 		server.prefillerURLPrefix = "https://"
 	}
 
 	return server
+}
+
+func (s *Server) setHandlers() {
+	switch s.config.Connector {
+	case ConnectorSharedStorage:
+		s.handlers = sharedstorage.NewSharedStorageHandlers(s.config, s.decoderProxy)
+	case ConnectorSGLang:
+		s.handlers = sglang.NewSGLangHandlers(s.config, s.decoderProxy)
+	case ConnectorNIXLV2:
+		fallthrough
+	default:
+		s.handlers = nixlv2.NewNixlv2Handlers(s.config, s.decoderProxy)
+	}
 }
 
 // Start the HTTP reverse proxy.
@@ -152,9 +181,9 @@ func (s *Server) Start(ctx context.Context, cert *tls.Certificate, allowlistVali
 	s.handler = s.createRoutes()
 
 	grp, ctx := errgroup.WithContext(ctx)
-	if err := s.startDataParallel(ctx, cert, grp); err != nil {
-		return err
-	}
+	// if err := s.startDataParallel(ctx, cert, grp); err != nil {
+	// 	return err
+	// }
 
 	grp.Go(func() error {
 		return s.startHTTP(ctx, cert)
@@ -166,33 +195,34 @@ func (s *Server) Start(ctx context.Context, cert *tls.Certificate, allowlistVali
 // Clone returns a clone of the current Server struct
 func (s *Server) Clone() *Server {
 	return &Server{
-		addr:                 s.addr,
-		port:                 s.port,
-		decoderURL:           s.decoderURL,
-		handler:              s.handler,
-		allowlistValidator:   s.allowlistValidator,
-		runConnectorProtocol: s.runConnectorProtocol,
-		decoderProxy:         s.decoderProxy,
-		prefillerURLPrefix:   s.prefillerURLPrefix,
-		prefillerProxies:     s.prefillerProxies,
-		dataParallelProxies:  s.dataParallelProxies,
-		forwardDataParallel:  s.forwardDataParallel,
+		addr:               s.addr,
+		port:               s.port,
+		decoderURL:         s.decoderURL,
+		handler:            s.handler,
+		allowlistValidator: s.allowlistValidator,
+		// runConnectorProtocol: s.runConnectorProtocol,
+		handlers:            s.handlers,
+		decoderProxy:        s.decoderProxy,
+		prefillerURLPrefix:  s.prefillerURLPrefix,
+		prefillerProxies:    s.prefillerProxies,
+		dataParallelProxies: s.dataParallelProxies,
+		forwardDataParallel: s.forwardDataParallel,
 	}
 }
 
-func (s *Server) setConnector() {
+// func (s *Server) setConnector() {
 
-	switch s.config.Connector {
-	case ConnectorSharedStorage:
-		s.runConnectorProtocol = s.runSharedStorageProtocol
-	case ConnectorSGLang:
-		s.runConnectorProtocol = s.runSGLangProtocol
-	case ConnectorNIXLV2:
-		fallthrough
-	default:
-		s.runConnectorProtocol = s.runNIXLProtocolV2
-	}
-}
+// 	switch s.config.Connector {
+// 	case ConnectorSharedStorage:
+// 		s.runConnectorProtocol = s.runSharedStorageProtocol
+// 	case ConnectorSGLang:
+// 		s.runConnectorProtocol = s.runSGLangProtocol
+// 	case ConnectorNIXLV2:
+// 		fallthrough
+// 	default:
+// 		s.runConnectorProtocol = s.runNIXLProtocolV2
+// 	}
+// }
 
 func (s *Server) createRoutes() *http.ServeMux {
 	// Configure handlers
@@ -202,8 +232,8 @@ func (s *Server) createRoutes() *http.ServeMux {
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	mux.HandleFunc("POST "+ChatCompletionsPath, s.chatCompletionsHandler) // /v1/chat/completions (openai)
-	mux.HandleFunc("POST "+CompletionsPath, s.chatCompletionsHandler)     // /v1/completions (legacy)
+	mux.HandleFunc("POST "+chatCompletionsPath, s.handlers.ChatCompletionsHandler) // /v1/chat/completions (openai)
+	mux.HandleFunc("POST "+completionsPath, s.handlers.ChatCompletionsHandler)     // /v1/completions (legacy)
 
 	s.decoderProxy = s.createDecoderProxyHandler(s.decoderURL, s.config.DecoderInsecureSkipVerify)
 
