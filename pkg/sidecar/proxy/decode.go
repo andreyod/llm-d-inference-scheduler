@@ -29,7 +29,20 @@ func (s *Server) sendDecodeRequest(w http.ResponseWriter, r *http.Request, compl
 	if s.forwardDataParallel && s.dataParallelHandler(w, r) {
 		return
 	}
+
+	// legacy completion API does not support chunked decode, so we only run it for chat completions
+	// TODO: consider supporting chunked decode for legacy completion API as well, which would require changes to the request/response format since they don't have the messages structure
+	// Try:
+	// 	{
+	//   "model": "your-model",
+	//   "prompt": "User: Tell me how transformers work.\nAssistant: Sure, transformers work by",
+	// }
 	if !s.config.EnableChunkedDecode {
+		s.logger.V(4).Info("sending request to decoder", "to", s.decoderURL.Host)
+		if completionRequest == nil {
+			s.decoderProxy.ServeHTTP(w, r)
+			return
+		}
 		dreq, err := setRequestBody(r, completionRequest)
 		if err != nil {
 			if err := errorJSONInvalid(err, w); err != nil {
@@ -37,14 +50,24 @@ func (s *Server) sendDecodeRequest(w http.ResponseWriter, r *http.Request, compl
 			}
 			return
 		}
-
-		s.logger.V(4).Info("sending request to decoder", "to", s.decoderURL.Host)
 		s.decoderProxy.ServeHTTP(w, dreq)
-
 		return
 	}
 	s.sendChunkedDecodeRequest(w, r, completionRequest)
 }
+
+// func tempPrepSGLangRequest(r *http.Request) (map[string]any, error) {
+// 	defer r.Body.Close() //nolint:all
+// 	original, err := io.ReadAll(r.Body)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	var requestData map[string]any
+// 	if err := json.Unmarshal(original, &requestData); err != nil { // TODO: use openai-go?
+// 		return nil, err
+// 	}
+// 	return requestData, nil
+// }
 
 type Message struct {
 	Role    string `json:"role"`
@@ -53,9 +76,25 @@ type Message struct {
 
 // Partial response struct TODO: use openai-go?
 type ChatCompletionResponse struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	Model   string `json:"model"`
 	Choices []struct {
 		Message      Message `json:"message"`
 		FinishReason string  `json:"finish_reason"`
+	} `json:"choices"`
+}
+
+type LegacyCompletionResponse struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	Model   string `json:"model"`
+	Choices []struct {
+		Text         string `json:"text"`
+		Index        int    `json:"index"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 }
 
@@ -71,13 +110,25 @@ func (s *Server) sendChunkedDecodeRequest(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	isLegacyCompletion := false
+	prompt, hasPrompt := completionRequest["prompt"]
+	if hasPrompt {
+		isLegacyCompletion = true
+		completionRequest["messages"] = []any{
+			map[string]any{
+				"role":    "user",
+				"content": prompt,
+			},
+		}
+		delete(completionRequest, "prompt")
+		r.URL.Path = ChatCompletionsPath
+	}
+
 	//TODO: validate if we should run chunked decode for this request
 	// based on the request parameters,
 	// e.g., continue_final_message, add_generation_prompt, max tokens, etc.
 
 	completionRequest[requestFieldMaxCompletionTokens] = s.config.DecodeChunkSize
-
-	s.logger.V(4).Info("sending chunked decode request", "chunk size", s.config.DecodeChunkSize)
 
 	messagesAny, ok := completionRequest["messages"]
 	if !ok {
@@ -100,8 +151,11 @@ func (s *Server) sendChunkedDecodeRequest(w http.ResponseWriter, r *http.Request
 			if err := errorJSONInvalid(err, w); err != nil {
 				s.logger.Error(err, "failed to send error response to client")
 			}
+			s.logger.Error(err, "-------- failed to marshal chunked decode request body")
 			return
 		}
+
+		s.logger.V(4).Info("sending chunked decode request", "chunk size", s.config.DecodeChunkSize)
 
 		rec := httptest.NewRecorder()
 		s.decoderProxy.ServeHTTP(rec, dreq)
@@ -109,6 +163,7 @@ func (s *Server) sendChunkedDecodeRequest(w http.ResponseWriter, r *http.Request
 		defer resp.Body.Close()
 
 		respBody, _ = io.ReadAll(resp.Body) // TODO: handle error
+		s.logger.V(4).Info("----- decoder response body", "body", string(respBody))
 		var parsed ChatCompletionResponse
 		if err := json.Unmarshal(respBody, &parsed); err != nil {
 			s.logger.Error(err, "failed to decode response")
@@ -141,6 +196,19 @@ func (s *Server) sendChunkedDecodeRequest(w http.ResponseWriter, r *http.Request
 		// Do not pull KV cache next time
 		delete(completionRequest, requestFieldKVTransferParams)
 
+		// TODO: for SGLang remove bootstrap info
+
+		// TODO: continue_final_message is not supported by SGLang
+		// For SGLang set continue_last_assistant :
+		// 	{
+		//   "model": "your-model",
+		//   "messages": [...],
+		//   "extra_body": {
+		//     "chat_template_kwargs": {
+		//       "continue_last_assistant": true
+		//     }
+		// If not set, it's up to the model to decide whether to continue the last assistant message
+
 		completionRequest["continue_final_message"] = true
 		completionRequest["add_generation_prompt"] = false
 
@@ -164,7 +232,29 @@ func (s *Server) sendChunkedDecodeRequest(w http.ResponseWriter, r *http.Request
 	}
 	finalResponse.Choices[0].Message.Content = responseMessageContent
 
-	respBody, err := json.Marshal(finalResponse)
+	var err error
+	if isLegacyCompletion {
+		legacyResp := LegacyCompletionResponse{
+			ID:      finalResponse.ID,
+			Object:  "text_completion",
+			Created: finalResponse.Created,
+			Model:   finalResponse.Model,
+			Choices: []struct {
+				Text         string `json:"text"`
+				Index        int    `json:"index"`
+				FinishReason string `json:"finish_reason"`
+			}{
+				{
+					Text:         responseMessageContent,
+					Index:        0,
+					FinishReason: finalResponse.Choices[0].FinishReason,
+				},
+			},
+		}
+		respBody, err = json.Marshal(legacyResp)
+	} else {
+		respBody, err = json.Marshal(finalResponse)
+	}
 	if err != nil {
 		s.logger.Error(err, "failed to marshal final decoder response")
 		return
